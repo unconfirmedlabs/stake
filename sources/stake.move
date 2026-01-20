@@ -1,251 +1,219 @@
+// Copyright (c) Studio Mirai, LLC
+// SPDX-License-Identifier: Apache-2.0
+
+/// A generic staking primitive for locking fungible assets.
+///
+/// Stake provides a simple model for locking balances and attaching extensions.
+/// Each Stake is an independent position with immutable balance - to increase
+/// total stake, create additional Stake objects. This mirrors Sui's native
+/// staking model where each delegation is a separate `StakedSui` object.
+///
+/// Extensions are isolated: each extension module can only read/write its own
+/// config via a witness pattern. This prevents unintended coupling between
+/// extensions operating on the same stake.
+///
+/// ## Design Principles
+///
+/// - **Immutable balance**: Set at creation, never modified. Ensures correct
+///   accounting when registered to multiple extensions (e.g., reward pools).
+/// - **Multiple positions**: Instead of modifying existing stakes, create new ones.
+///   Enables partial withdrawals by destroying individual stakes.
+/// - **Extension sandboxing**: Witness-gated access ensures extensions operate
+///   in isolation without reading or interfering with each other's state.
+/// - **Owned object model**: No capability required; object ownership provides
+///   authorization. Wrap in a shared object with caps if shared access is needed.
 module stake::stake;
 
 use std::type_name::{TypeName, with_defining_ids};
-use sui::balance::{Self, Balance};
+use sui::balance::Balance;
 use sui::dynamic_field as df;
 use sui::event::emit;
 use sui::vec_set::{Self, VecSet};
 
-//=== Structs ===
+// === Structs ===
 
-public struct Stake<phantom S> has key, store {
+/// A stake position holding a fixed balance of `Share` tokens.
+///
+/// The balance is immutable after creation. Extensions can be attached
+/// to enable functionality like reward distribution or governance.
+public struct Stake<phantom Share> has key, store {
     id: UID,
-    state: StakeState,
-    balance: Balance<S>,
+    /// Tracks attached extension types for enumeration and destroy-time validation.
+    extensions: VecSet<TypeName>,
+    /// The staked balance. Immutable after creation.
+    balance: Balance<Share>,
 }
 
-public struct StakeExtension<phantom E>() has copy, drop, store;
+/// Dynamic field key for storing extension configs.
+public struct ExtensionKey<phantom Extension: drop>() has copy, drop, store;
 
-//=== Enums ===
+// === Events ===
 
-public enum StakeState has copy, drop, store {
-    Unlocked,
-    Locked { extensions: VecSet<TypeName> },
-}
-
-//=== Events ===
-
+/// Emitted when a stake is created.
 public struct StakeCreatedEvent has copy, drop {
     stake_id: ID,
+    amount: u64,
 }
 
-public struct StakeLockedEvent has copy, drop {
-    stake_id: ID,
-}
-
-public struct StakeUnlockedEvent has copy, drop {
-    stake_id: ID,
-}
-
-public struct StakeDepositEvent has copy, drop {
+/// Emitted when a stake is destroyed.
+public struct StakeDestroyedEvent has copy, drop {
     stake_id: ID,
     amount: u64,
 }
 
-public struct StakeWithdrawEvent has copy, drop {
+/// Emitted when an extension is added to a stake.
+public struct ExtensionAddedEvent<phantom Extension: drop> has copy, drop {
     stake_id: ID,
-    amount: u64,
 }
 
-public struct ExtensionAddedEvent has copy, drop {
+/// Emitted when an extension is removed from a stake.
+public struct ExtensionRemovedEvent<phantom Extension: drop> has copy, drop {
     stake_id: ID,
-    extension_type: TypeName,
 }
 
-public struct ExtensionRemovedEvent has copy, drop {
-    stake_id: ID,
-    extension_type: TypeName,
-}
+// === Errors ===
 
-//=== Errors ===
-
-const ENotUnlocked: u64 = 0;
-const ENotLocked: u64 = 1;
+/// Extension of this type is already attached.
+const EExtensionAlreadyExists: u64 = 0;
+/// Extension of this type is not attached.
+const EExtensionNotFound: u64 = 1;
+/// Cannot destroy stake with active extensions.
 const EExtensionsNotEmpty: u64 = 2;
-const EExtensionAlreadyExists: u64 = 3;
-const EExtensionNotFound: u64 = 4;
-const EInsufficientBalance: u64 = 5;
+/// Cannot create stake with zero balance.
+const EZeroBalance: u64 = 3;
 
-//=== Public Functions ===
+// === Public Functions ===
 
-public fun new<S>(ctx: &mut TxContext): Stake<S> {
+/// Create a new stake with the given balance.
+///
+/// Aborts if `balance` is zero.
+public fun new<Share>(balance: Balance<Share>, ctx: &mut TxContext): Stake<Share> {
+    assert!(balance.value() > 0, EZeroBalance);
+
     let stake = Stake {
         id: object::new(ctx),
-        state: StakeState::Unlocked,
-        balance: balance::zero(),
+        extensions: vec_set::empty(),
+        balance,
     };
 
     emit(StakeCreatedEvent {
         stake_id: stake.id(),
+        amount: stake.balance.value(),
     });
 
     stake
 }
 
-public fun lock<S>(self: &mut Stake<S>) {
-    match (&self.state) {
-        StakeState::Unlocked => {
-            self.state = StakeState::Locked { extensions: vec_set::empty() };
+/// Destroy a stake and reclaim the balance.
+///
+/// Aborts if any extensions are still attached.
+public fun destroy<Share>(stake: Stake<Share>): Balance<Share> {
+    let Stake { id, extensions, balance } = stake;
 
-            emit(StakeLockedEvent {
-                stake_id: self.id(),
-            });
-        },
-        _ => abort ENotUnlocked,
-    }
-}
+    assert!(extensions.is_empty(), EExtensionsNotEmpty);
 
-public fun unlock<S>(self: &mut Stake<S>) {
-    match (&self.state) {
-        StakeState::Locked { extensions } => {
-            assert!(extensions.is_empty(), EExtensionsNotEmpty);
-            self.state = StakeState::Unlocked;
-
-            emit(StakeUnlockedEvent {
-                stake_id: self.id(),
-            });
-        },
-        _ => abort ENotLocked,
-    }
-}
-
-public fun deposit<S>(self: &mut Stake<S>, balance: Balance<S>) {
-    let amount = balance.value();
-    self.balance.join(balance);
-
-    emit(StakeDepositEvent {
-        stake_id: self.id(),
-        amount,
+    emit(StakeDestroyedEvent {
+        stake_id: id.to_inner(),
+        amount: balance.value(),
     });
-}
-
-public fun withdraw<S>(self: &mut Stake<S>, amount: Option<u64>): Balance<S> {
-    match (&self.state) {
-        StakeState::Unlocked => {
-            let withdraw_amount = amount.destroy_or!(self.balance.value());
-            assert!(withdraw_amount <= self.balance.value(), EInsufficientBalance);
-
-            emit(StakeWithdrawEvent {
-                stake_id: self.id(),
-                amount: withdraw_amount,
-            });
-
-            self.balance.split(withdraw_amount)
-        },
-        _ => abort ENotUnlocked,
-    }
-}
-
-public fun add_extension<S, E: store>(
-    self: &mut Stake<S>,
-    extension: E,
-) {
-    let extension_type = with_defining_ids<E>();
-
-    match (&mut self.state) {
-        StakeState::Locked { extensions } => {
-            assert!(!extensions.contains(&extension_type), EExtensionAlreadyExists);
-            extensions.insert(extension_type);
-        },
-        _ => abort ENotLocked,
-    };
-
-    df::add(&mut self.id, StakeExtension<E>(), extension);
-
-    emit(ExtensionAddedEvent {
-        stake_id: self.id(),
-        extension_type,
-    });
-}
-
-public fun borrow_extension<S, E: store>(self: &Stake<S>): &E {
-    assert!(has_extension<S, E>(self), EExtensionNotFound);
-    df::borrow(&self.id, StakeExtension<E>())
-}
-
-public fun borrow_extension_mut<S, E: store>(
-    self: &mut Stake<S>,
-): &mut E {
-    assert!(has_extension<S, E>(self), EExtensionNotFound);
-    df::borrow_mut(&mut self.id, StakeExtension<E>())
-}
-
-public fun remove_extension<S, E: store>(self: &mut Stake<S>): E {
-    let extension_type = with_defining_ids<E>();
-
-    match (&mut self.state) {
-        StakeState::Locked { extensions } => {
-            assert!(extensions.contains(&extension_type), EExtensionNotFound);
-            extensions.remove(&extension_type);
-        },
-        _ => abort ENotLocked,
-    };
-
-    emit(ExtensionRemovedEvent {
-        stake_id: self.id(),
-        extension_type,
-    });
-
-    df::remove(&mut self.id, StakeExtension<E>())
-}
-
-public fun has_extension<S, E: store>(self: &Stake<S>): bool {
-    df::exists_with_type<StakeExtension<E>, E>(&self.id, StakeExtension<E>())
-}
-
-public fun destroy<S>(stake: Stake<S>): Balance<S> {
-    let Stake { id, state, balance } = stake;
-
-    match (state) {
-        StakeState::Unlocked => {},
-        _ => abort ENotUnlocked,
-    };
 
     id.delete();
     balance
 }
 
-//=== Public View Functions ===
+/// Attach an extension to the stake.
+///
+/// - `Extension`: Witness type identifying the extension. Only the module
+///   defining this type can call extension functions.
+/// - `Config`: Data stored for this extension. Requires `drop` so the stake
+///   owner can always remove extensions, even without graceful cleanup.
+///
+/// Aborts if an extension of this type is already attached.
+public fun add_extension<Share, Extension: drop, Config: store + drop>(
+    self: &mut Stake<Share>,
+    _: Extension,
+    config: Config,
+) {
+    let extension_type = with_defining_ids<Extension>();
+    assert!(!self.extensions.contains(&extension_type), EExtensionAlreadyExists);
 
-public fun id<S>(self: &Stake<S>): ID {
+    df::add(&mut self.id, ExtensionKey<Extension>(), config);
+    self.extensions.insert(extension_type);
+
+    emit(ExtensionAddedEvent<Extension> {
+        stake_id: self.id(),
+    });
+}
+
+/// Borrow an extension's config immutably.
+///
+/// Requires the `Extension` witness, ensuring only the extension module
+/// can read its own config.
+///
+/// Aborts if the extension is not attached.
+public fun borrow_extension<Share, Extension: drop, Config: store + drop>(
+    _: Extension,
+    self: &Stake<Share>,
+): &Config {
+    assert!(has_extension<Share, Extension>(self), EExtensionNotFound);
+    df::borrow(&self.id, ExtensionKey<Extension>())
+}
+
+/// Borrow an extension's config mutably.
+///
+/// Requires the `Extension` witness, ensuring only the extension module
+/// can modify its own config.
+///
+/// Aborts if the extension is not attached.
+public fun borrow_extension_mut<Share, Extension: drop, Config: store + drop>(
+    _: Extension,
+    self: &mut Stake<Share>,
+): &mut Config {
+    assert!(has_extension<Share, Extension>(self), EExtensionNotFound);
+    df::borrow_mut(&mut self.id, ExtensionKey<Extension>())
+}
+
+/// Remove an extension from the stake and return its config.
+///
+/// The returned `Config` has `drop`, so callers can discard it if cleanup
+/// isn't needed. Extension modules should provide their own unregister
+/// functions that perform proper cleanup before calling this.
+///
+/// Aborts if the extension is not attached.
+public fun remove_extension<Share, Extension: drop, Config: store + drop>(
+    self: &mut Stake<Share>,
+): Config {
+    let extension_type = with_defining_ids<Extension>();
+    assert!(self.extensions.contains(&extension_type), EExtensionNotFound);
+
+    self.extensions.remove(&extension_type);
+
+    emit(ExtensionRemovedEvent<Extension> {
+        stake_id: self.id(),
+    });
+
+    df::remove(&mut self.id, ExtensionKey<Extension>())
+}
+
+// === Accessors ===
+
+/// Returns the stake's object ID.
+public fun id<Share>(self: &Stake<Share>): ID {
     self.id.to_inner()
 }
 
-public fun balance<S>(self: &Stake<S>): &Balance<S> {
+/// Returns a reference to the staked balance.
+public fun balance<Share>(self: &Stake<Share>): &Balance<Share> {
     &self.balance
 }
 
-public fun state<S>(self: &Stake<S>): &StakeState {
-    &self.state
+/// Returns the set of attached extension types.
+public fun extensions<Share>(self: &Stake<Share>): &VecSet<TypeName> {
+    &self.extensions
 }
 
-public fun is_unlocked<S>(self: &Stake<S>): bool {
-    match (&self.state) {
-        StakeState::Unlocked => true,
-        _ => false,
-    }
-}
-
-public fun is_locked<S>(self: &Stake<S>): bool {
-    match (&self.state) {
-        StakeState::Locked { .. } => true,
-        _ => false,
-    }
-}
-
-public fun extensions<S>(self: &Stake<S>): &VecSet<TypeName> {
-    match (&self.state) {
-        StakeState::Locked { extensions } => extensions,
-        _ => abort ENotLocked,
-    }
-}
-
-//=== UID Functions ===
-
-public fun uid<S>(self: &Stake<S>): &UID {
-    &self.id
-}
-
-public fun uid_mut<S>(self: &mut Stake<S>): &mut UID {
-    &mut self.id
+/// Check if an extension type is attached.
+public fun has_extension<Share, Extension: drop>(self: &Stake<Share>): bool {
+    let extension_type = with_defining_ids<Extension>();
+    self.extensions.contains(&extension_type)
 }
