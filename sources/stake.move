@@ -1,4 +1,4 @@
-// Copyright (c) Studio Mirai, LLC
+// Copyright (c) Unconfirmed Labs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
 /// A generic staking primitive for locking fungible assets.

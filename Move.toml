@@ -2,7 +2,4 @@
 name = "stake"
 edition = "2024"
 license = "MIT"
-authors = ["Studio Mirai, LLC (build@sm.xyz)"]
-
-[environments]
-mirainet = "f1eb94c0"
+authors = ["Unconfirmed Labs, LLC (os@unconfirmed.com)"]
