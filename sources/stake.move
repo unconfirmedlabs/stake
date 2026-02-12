@@ -5,13 +5,8 @@
 ///
 /// Stake provides a simple model for locking balances, collecting authority badges,
 /// and attaching extensions. Each Stake is an independent position with immutable
-/// balance - to increase total stake, create additional Stake objects. This mirrors
+/// balance — to increase total stake, create additional Stake objects. This mirrors
 /// Sui's native staking model where each delegation is a separate `StakedSui` object.
-///
-/// Authorities are permanent, non-removable badges that prove the stake was created
-/// through a specific interaction (e.g., burning tokens). Extensions are stateful
-/// attachments that enable functionality like reward distribution or governance.
-/// Both are witness-gated, ensuring only the defining module can add them.
 ///
 /// ## Design Principles
 ///
@@ -23,14 +18,19 @@
 ///   specific interactions. Non-removable by design — a credential cannot be revoked
 ///   by the holder (e.g., you cannot un-burn tokens). Consumers like reward pools
 ///   can gate access based on these badges.
-/// - **Extensions as capabilities**: Stateful attachments representing active
-///   relationships (e.g., reward pool registration). Witness-gated for writes,
-///   but removable by the stake owner for cleanup.
+/// - **Extensions as isolated namespaces**: Each extension type gets its own isolated
+///   `Bag` for storage, following the Sui Kiosk extension pattern. Access control is
+///   enforced by `drop`-only witnesses — only the module defining the witness can
+///   read or write its own extension data. Extensions can store multiple items in
+///   their Bag (e.g., registrations with multiple reward pools).
+/// - **Cooperative removal**: The stake owner can remove an extension only when its
+///   storage is empty. The extension module controls cleanup of its own data.
 /// - **Owned object model**: No capability required; object ownership provides
 ///   authorization. Wrap in a shared object with caps if shared access is needed.
 module stake::stake;
 
 use std::type_name::{TypeName, with_defining_ids};
+use sui::bag::{Self, Bag};
 use sui::balance::Balance;
 use sui::dynamic_field as df;
 use sui::event::emit;
@@ -40,21 +40,28 @@ use sui::vec_set::{Self, VecSet};
 
 /// A stake position holding a fixed balance of `Share` tokens.
 ///
-/// The balance is immutable after creation. Extensions can be attached
-/// to enable functionality like reward distribution or governance.
+/// The balance is immutable after creation. Authorities and extensions can be
+/// attached to enable functionality like reward distribution or governance.
 public struct Stake<phantom Share> has key, store {
     id: UID,
     /// Permanent badges proving the stake completed specific interactions.
     /// Added by witness-gated modules, non-removable by the stake owner.
     authorities: VecSet<TypeName>,
-    /// Tracks attached extension types for enumeration and destroy-time validation.
-    extensions: VecSet<TypeName>,
     /// The staked balance. Immutable after creation.
     balance: Balance<Share>,
+    /// Number of installed extensions. Must be 0 to destroy.
+    extension_count: u64,
 }
 
-/// Dynamic field key for storing extension configs.
-public struct ExtensionKey<phantom Extension: drop>() has copy, drop, store;
+/// An extension installed on a Stake. Each extension type gets its own isolated
+/// `Bag` for storage, allowing it to store multiple items keyed however it likes.
+public struct Extension has store {
+    storage: Bag,
+}
+
+/// Type-based dynamic field key for extensions. The phantom `Ext` type identifies
+/// the extension and ensures one extension per type per Stake.
+public struct ExtensionKey<phantom Ext: drop>() has copy, drop, store;
 
 // === Events ===
 
@@ -70,33 +77,35 @@ public struct StakeDestroyedEvent has copy, drop {
     amount: u64,
 }
 
-/// Emitted when an extension is added to a stake.
-public struct ExtensionAddedEvent<phantom Extension: drop> has copy, drop {
-    stake_id: ID,
-}
-
-/// Emitted when an extension is removed from a stake.
-public struct ExtensionRemovedEvent<phantom Extension: drop> has copy, drop {
-    stake_id: ID,
-}
-
 /// Emitted when an authority is added to a stake.
 public struct AuthorityAddedEvent<phantom Authority: drop> has copy, drop {
     stake_id: ID,
 }
 
+/// Emitted when an extension is installed on a stake.
+public struct ExtensionInstalledEvent<phantom Ext: drop> has copy, drop {
+    stake_id: ID,
+}
+
+/// Emitted when an extension is removed from a stake.
+public struct ExtensionRemovedEvent<phantom Ext: drop> has copy, drop {
+    stake_id: ID,
+}
+
 // === Errors ===
 
-/// Extension of this type is already attached.
-const EExtensionAlreadyExists: u64 = 0;
-/// Extension of this type is not attached.
-const EExtensionNotFound: u64 = 1;
+/// Cannot create stake with zero balance.
+const EZeroBalance: u64 = 0;
+/// Authority of this type is already attached.
+const EAuthorityAlreadyExists: u64 = 1;
 /// Cannot destroy stake with active extensions.
 const EExtensionsNotEmpty: u64 = 2;
-/// Cannot create stake with zero balance.
-const EZeroBalance: u64 = 3;
-/// Authority of this type is already attached.
-const EAuthorityAlreadyExists: u64 = 4;
+/// Extension of this type is already installed.
+const EExtensionAlreadyInstalled: u64 = 3;
+/// Extension of this type is not installed.
+const EExtensionNotInstalled: u64 = 4;
+/// Cannot remove extension with non-empty storage.
+const EExtensionStorageNotEmpty: u64 = 5;
 
 // === Public Functions ===
 
@@ -109,8 +118,8 @@ public fun new<Share>(balance: Balance<Share>, ctx: &mut TxContext): Stake<Share
     let stake = Stake {
         id: object::new(ctx),
         authorities: vec_set::empty(),
-        extensions: vec_set::empty(),
         balance,
+        extension_count: 0,
     };
 
     emit(StakeCreatedEvent {
@@ -128,10 +137,7 @@ public fun new<Share>(balance: Balance<Share>, ctx: &mut TxContext): Stake<Share
 /// (e.g., a module that burns tokens before stamping the stake).
 ///
 /// Aborts if the authority is already attached.
-public fun add_authority<Share, Authority: drop>(
-    self: &mut Stake<Share>,
-    _: Authority,
-) {
+public fun add_authority<Share, Authority: drop>(self: &mut Stake<Share>, _: Authority) {
     let authority_type = with_defining_ids<Authority>();
     assert!(!self.authorities.contains(&authority_type), EAuthorityAlreadyExists);
 
@@ -144,11 +150,11 @@ public fun add_authority<Share, Authority: drop>(
 
 /// Destroy a stake and reclaim the balance.
 ///
-/// Aborts if any extensions are still attached.
+/// Aborts if any extensions are still installed.
 public fun destroy<Share>(stake: Stake<Share>): Balance<Share> {
-    let Stake { id, extensions, balance, .. } = stake;
+    let Stake { id, balance, extension_count, .. } = stake;
 
-    assert!(extensions.is_empty(), EExtensionsNotEmpty);
+    assert!(extension_count == 0, EExtensionsNotEmpty);
 
     emit(StakeDestroyedEvent {
         stake_id: id.to_inner(),
@@ -159,78 +165,59 @@ public fun destroy<Share>(stake: Stake<Share>): Balance<Share> {
     balance
 }
 
-/// Attach an extension to the stake.
+/// Install an extension on the stake. Each extension type gets its own isolated
+/// `Bag` for storage. Only the module defining `Ext` can install it.
 ///
-/// - `Extension`: Witness type identifying the extension. Only the module
-///   defining this type can call extension functions.
-/// - `Config`: Data stored for this extension. Requires `drop` so the stake
-///   owner can always remove extensions, even without graceful cleanup.
-///
-/// Aborts if an extension of this type is already attached.
-public fun add_extension<Share, Extension: drop, Config: store + drop>(
-    self: &mut Stake<Share>,
-    _: Extension,
-    config: Config,
-) {
-    let extension_type = with_defining_ids<Extension>();
-    assert!(!self.extensions.contains(&extension_type), EExtensionAlreadyExists);
+/// Aborts if the extension is already installed.
+public fun add_extension<Share, Ext: drop>(self: &mut Stake<Share>, _: Ext, ctx: &mut TxContext) {
+    assert!(!has_extension<Share, Ext>(self), EExtensionAlreadyInstalled);
 
-    df::add(&mut self.id, ExtensionKey<Extension>(), config);
-    self.extensions.insert(extension_type);
+    df::add(
+        &mut self.id,
+        ExtensionKey<Ext>(),
+        Extension {
+            storage: bag::new(ctx),
+        },
+    );
 
-    emit(ExtensionAddedEvent<Extension> {
+    self.extension_count = self.extension_count + 1;
+
+    emit(ExtensionInstalledEvent<Ext> {
         stake_id: self.id(),
     });
 }
 
-/// Borrow an extension's config immutably.
+/// Remove an extension from the stake. Can only be performed when the
+/// extension's storage is empty — the extension module must clean up first.
 ///
-/// Requires the `Extension` witness, ensuring only the extension module
-/// can read its own config.
-///
-/// Aborts if the extension is not attached.
-public fun borrow_extension<Share, Extension: drop, Config: store + drop>(
-    _: Extension,
-    self: &Stake<Share>,
-): &Config {
-    assert!(has_extension<Share, Extension>(self), EExtensionNotFound);
-    df::borrow(&self.id, ExtensionKey<Extension>())
-}
+/// This enables cooperative removal: the extension controls its data lifecycle,
+/// and the owner can reclaim the stake once all extensions are cleaned up.
+public fun remove_extension<Share, Ext: drop>(self: &mut Stake<Share>) {
+    assert!(has_extension<Share, Ext>(self), EExtensionNotInstalled);
 
-/// Borrow an extension's config mutably.
-///
-/// Requires the `Extension` witness, ensuring only the extension module
-/// can modify its own config.
-///
-/// Aborts if the extension is not attached.
-public fun borrow_extension_mut<Share, Extension: drop, Config: store + drop>(
-    _: Extension,
-    self: &mut Stake<Share>,
-): &mut Config {
-    assert!(has_extension<Share, Extension>(self), EExtensionNotFound);
-    df::borrow_mut(&mut self.id, ExtensionKey<Extension>())
-}
+    let Extension { storage } = df::remove(&mut self.id, ExtensionKey<Ext>());
+    assert!(storage.is_empty(), EExtensionStorageNotEmpty);
+    storage.destroy_empty();
 
-/// Remove an extension from the stake and return its config.
-///
-/// The returned `Config` has `drop`, so callers can discard it if cleanup
-/// isn't needed. Extension modules should provide their own unregister
-/// functions that perform proper cleanup before calling this.
-///
-/// Aborts if the extension is not attached.
-public fun remove_extension<Share, Extension: drop, Config: store + drop>(
-    self: &mut Stake<Share>,
-): Config {
-    let extension_type = with_defining_ids<Extension>();
-    assert!(self.extensions.contains(&extension_type), EExtensionNotFound);
+    self.extension_count = self.extension_count - 1;
 
-    self.extensions.remove(&extension_type);
-
-    emit(ExtensionRemovedEvent<Extension> {
+    emit(ExtensionRemovedEvent<Ext> {
         stake_id: self.id(),
     });
+}
 
-    df::remove(&mut self.id, ExtensionKey<Extension>())
+/// Get immutable access to the extension's storage. Can only be performed by
+/// the extension module (requires witness).
+public fun storage<Share, Ext: drop>(self: &Stake<Share>, _: Ext): &Bag {
+    assert!(has_extension<Share, Ext>(self), EExtensionNotInstalled);
+    &df::borrow<ExtensionKey<Ext>, Extension>(&self.id, ExtensionKey()).storage
+}
+
+/// Get mutable access to the extension's storage. Can only be performed by
+/// the extension module (requires witness).
+public fun storage_mut<Share, Ext: drop>(self: &mut Stake<Share>, _: Ext): &mut Bag {
+    assert!(has_extension<Share, Ext>(self), EExtensionNotInstalled);
+    &mut df::borrow_mut<ExtensionKey<Ext>, Extension>(&mut self.id, ExtensionKey()).storage
 }
 
 // === Accessors ===
@@ -245,30 +232,32 @@ public fun balance<Share>(self: &Stake<Share>): &Balance<Share> {
     &self.balance
 }
 
-/// Returns the set of attached extension types.
-public fun extensions<Share>(self: &Stake<Share>): &VecSet<TypeName> {
-    &self.extensions
-}
-
 /// Returns the set of authority badges.
 public fun authorities<Share>(self: &Stake<Share>): &VecSet<TypeName> {
     &self.authorities
 }
 
-/// Check if an authority badge is attached.
-public fun has_authority<Share, Authority: drop>(self: &Stake<Share>): bool {
-    let authority_type = with_defining_ids<Authority>();
-    self.authorities.contains(&authority_type)
+/// Returns the number of installed extensions.
+public fun extension_count<Share>(self: &Stake<Share>): u64 {
+    self.extension_count
 }
 
-/// Check if an authority type (by TypeName) is attached.
-/// Useful when the authority type is not known at compile time.
+/// Check if an authority badge of the given type is attached.
 public fun has_authority_type<Share>(self: &Stake<Share>, authority_type: &TypeName): bool {
     self.authorities.contains(authority_type)
 }
 
-/// Check if an extension type is attached.
-public fun has_extension<Share, Extension: drop>(self: &Stake<Share>): bool {
-    let extension_type = with_defining_ids<Extension>();
-    self.extensions.contains(&extension_type)
+/// Check if an authority badge of the given type is attached.
+public fun has_authority<Share, Authority: drop>(self: &Stake<Share>): bool {
+    self.authorities.contains(&with_defining_ids<Authority>())
+}
+
+/// Check if an extension is installed.
+public fun has_extension<Share, Ext: drop>(self: &Stake<Share>): bool {
+    df::exists_with_type<ExtensionKey<Ext>, Extension>(&self.id, ExtensionKey<Ext>())
+}
+
+/// Returns the value of the stake.
+public fun value<Share>(self: &Stake<Share>): u64 {
+    self.balance.value()
 }
