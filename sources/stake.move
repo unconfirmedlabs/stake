@@ -38,20 +38,12 @@ use sui::vec_set::{Self, VecSet};
 /// to enable functionality like reward distribution or governance.
 public struct Stake<phantom Share> has key, store {
     id: UID,
-    /// The policy for the stake.
-    kind: StakeKind,
+    /// Stores witness types for integrations that require authorization.
+    authorities: VecSet<TypeName>,
     /// Tracks attached extension types for enumeration and destroy-time validation.
     extensions: VecSet<TypeName>,
     /// The staked balance. Immutable after creation.
     balance: Balance<Share>,
-}
-
-/// The kind of stake.
-public enum StakeKind has copy, drop, store {
-    /// The stake does not have any witness-gated functionality.
-    Open,
-    /// The stake requires a witness type for creation.
-    Gated(TypeName),
 }
 
 /// Dynamic field key for storing extension configs.
@@ -81,6 +73,11 @@ public struct ExtensionRemovedEvent<phantom Extension: drop> has copy, drop {
     stake_id: ID,
 }
 
+/// Emitted when an authority is added to a stake.
+public struct AuthorityAddedEvent<phantom Authority: drop> has copy, drop {
+    stake_id: ID,
+}
+
 // === Errors ===
 
 /// Extension of this type is already attached.
@@ -91,20 +88,20 @@ const EExtensionNotFound: u64 = 1;
 const EExtensionsNotEmpty: u64 = 2;
 /// Cannot create stake with zero balance.
 const EZeroBalance: u64 = 3;
-/// Cannot access witness-gated stake without witness.
-const ENotGated: u64 = 4;
+/// Authority of this type is already attached.
+const EAuthorityAlreadyExists: u64 = 4;
 
 // === Public Functions ===
 
 /// Create a new stake with the given balance.
 ///
 /// Aborts if `balance` is zero.
-public fun new<Share>(kind: StakeKind, balance: Balance<Share>, ctx: &mut TxContext): Stake<Share> {
+public fun new<Share>(balance: Balance<Share>, ctx: &mut TxContext): Stake<Share> {
     assert!(balance.value() > 0, EZeroBalance);
 
     let stake = Stake {
         id: object::new(ctx),
-        kind,
+        authorities: vec_set::empty(),
         extensions: vec_set::empty(),
         balance,
     };
@@ -117,12 +114,25 @@ public fun new<Share>(kind: StakeKind, balance: Balance<Share>, ctx: &mut TxCont
     stake
 }
 
-public fun new_open_kind(): StakeKind {
-    StakeKind::Open
-}
+/// Add an authority badge to the stake.
+///
+/// Only the module defining the `Authority` witness type can call this, ensuring
+/// that badges are only granted by the modules that control the underlying interaction
+/// (e.g., a module that burns tokens before stamping the stake).
+///
+/// Aborts if the authority is already attached.
+public fun add_authority<Share, Authority: drop>(
+    self: &mut Stake<Share>,
+    _: Authority,
+) {
+    let authority_type = with_defining_ids<Authority>();
+    assert!(!self.authorities.contains(&authority_type), EAuthorityAlreadyExists);
 
-public fun new_gated_kind<Witness: drop>(_: Witness): StakeKind {
-    StakeKind::Gated(with_defining_ids<Witness>())
+    self.authorities.insert(authority_type);
+
+    emit(AuthorityAddedEvent<Authority> {
+        stake_id: self.id(),
+    });
 }
 
 /// Destroy a stake and reclaim the balance.
@@ -233,15 +243,25 @@ public fun extensions<Share>(self: &Stake<Share>): &VecSet<TypeName> {
     &self.extensions
 }
 
+/// Returns the set of authority badges.
+public fun authorities<Share>(self: &Stake<Share>): &VecSet<TypeName> {
+    &self.authorities
+}
+
+/// Check if an authority badge is attached.
+public fun has_authority<Share, Authority: drop>(self: &Stake<Share>): bool {
+    let authority_type = with_defining_ids<Authority>();
+    self.authorities.contains(&authority_type)
+}
+
+/// Check if an authority type (by TypeName) is attached.
+/// Useful when the authority type is not known at compile time.
+public fun has_authority_type<Share>(self: &Stake<Share>, authority_type: &TypeName): bool {
+    self.authorities.contains(authority_type)
+}
+
 /// Check if an extension type is attached.
 public fun has_extension<Share, Extension: drop>(self: &Stake<Share>): bool {
     let extension_type = with_defining_ids<Extension>();
     self.extensions.contains(&extension_type)
-}
-
-public fun witness_gate_type<Share>(self: &Stake<Share>): &TypeName {
-    match (&self.kind) {
-        StakeKind::Gated(type_name) => type_name,
-        StakeKind::Open => abort ENotGated,
-    }
 }
