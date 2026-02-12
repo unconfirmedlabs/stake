@@ -243,13 +243,13 @@ public fun extension_count<Share>(self: &Stake<Share>): u64 {
 }
 
 /// Check if an authority badge of the given type is attached.
-public fun has_authority_type<Share>(self: &Stake<Share>, authority_type: &TypeName): bool {
-    self.authorities.contains(authority_type)
+public fun has_authority<Share, Authority: drop>(self: &Stake<Share>): bool {
+    self.authorities.contains(&with_defining_ids<Authority>())
 }
 
 /// Check if an authority badge of the given type is attached.
-public fun has_authority<Share, Authority: drop>(self: &Stake<Share>): bool {
-    self.authorities.contains(&with_defining_ids<Authority>())
+public fun has_authority_by_type<Share>(self: &Stake<Share>, authority_type: &TypeName): bool {
+    self.authorities.contains(authority_type)
 }
 
 /// Check if an extension is installed.
