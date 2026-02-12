@@ -38,10 +38,20 @@ use sui::vec_set::{Self, VecSet};
 /// to enable functionality like reward distribution or governance.
 public struct Stake<phantom Share> has key, store {
     id: UID,
+    /// The policy for the stake.
+    kind: StakeKind,
     /// Tracks attached extension types for enumeration and destroy-time validation.
     extensions: VecSet<TypeName>,
     /// The staked balance. Immutable after creation.
     balance: Balance<Share>,
+}
+
+/// The kind of stake.
+public enum StakeKind has copy, drop, store {
+    /// The stake does not have any witness-gated functionality.
+    Open,
+    /// The stake requires a witness type for creation.
+    Gated(TypeName),
 }
 
 /// Dynamic field key for storing extension configs.
@@ -81,17 +91,20 @@ const EExtensionNotFound: u64 = 1;
 const EExtensionsNotEmpty: u64 = 2;
 /// Cannot create stake with zero balance.
 const EZeroBalance: u64 = 3;
+/// Cannot access witness-gated stake without witness.
+const ENotGated: u64 = 4;
 
 // === Public Functions ===
 
 /// Create a new stake with the given balance.
 ///
 /// Aborts if `balance` is zero.
-public fun new<Share>(balance: Balance<Share>, ctx: &mut TxContext): Stake<Share> {
+public fun new<Share>(kind: StakeKind, balance: Balance<Share>, ctx: &mut TxContext): Stake<Share> {
     assert!(balance.value() > 0, EZeroBalance);
 
     let stake = Stake {
         id: object::new(ctx),
+        kind,
         extensions: vec_set::empty(),
         balance,
     };
@@ -104,11 +117,19 @@ public fun new<Share>(balance: Balance<Share>, ctx: &mut TxContext): Stake<Share
     stake
 }
 
+public fun new_open_kind(): StakeKind {
+    StakeKind::Open
+}
+
+public fun new_gated_kind<Witness: drop>(_: Witness): StakeKind {
+    StakeKind::Gated(with_defining_ids<Witness>())
+}
+
 /// Destroy a stake and reclaim the balance.
 ///
 /// Aborts if any extensions are still attached.
 public fun destroy<Share>(stake: Stake<Share>): Balance<Share> {
-    let Stake { id, extensions, balance } = stake;
+    let Stake { id, extensions, balance, .. } = stake;
 
     assert!(extensions.is_empty(), EExtensionsNotEmpty);
 
@@ -216,4 +237,11 @@ public fun extensions<Share>(self: &Stake<Share>): &VecSet<TypeName> {
 public fun has_extension<Share, Extension: drop>(self: &Stake<Share>): bool {
     let extension_type = with_defining_ids<Extension>();
     self.extensions.contains(&extension_type)
+}
+
+public fun witness_gate_type<Share>(self: &Stake<Share>): &TypeName {
+    match (&self.kind) {
+        StakeKind::Gated(type_name) => type_name,
+        StakeKind::Open => abort ENotGated,
+    }
 }
