@@ -3,14 +3,15 @@
 
 /// A generic staking primitive for locking fungible assets.
 ///
-/// Stake provides a simple model for locking balances and attaching extensions.
-/// Each Stake is an independent position with immutable balance - to increase
-/// total stake, create additional Stake objects. This mirrors Sui's native
-/// staking model where each delegation is a separate `StakedSui` object.
+/// Stake provides a simple model for locking balances, collecting authority badges,
+/// and attaching extensions. Each Stake is an independent position with immutable
+/// balance - to increase total stake, create additional Stake objects. This mirrors
+/// Sui's native staking model where each delegation is a separate `StakedSui` object.
 ///
-/// Extensions are isolated: each extension module can only read/write its own
-/// config via a witness pattern. This prevents unintended coupling between
-/// extensions operating on the same stake.
+/// Authorities are permanent, non-removable badges that prove the stake was created
+/// through a specific interaction (e.g., burning tokens). Extensions are stateful
+/// attachments that enable functionality like reward distribution or governance.
+/// Both are witness-gated, ensuring only the defining module can add them.
 ///
 /// ## Design Principles
 ///
@@ -18,8 +19,13 @@
 ///   accounting when registered to multiple extensions (e.g., reward pools).
 /// - **Multiple positions**: Instead of modifying existing stakes, create new ones.
 ///   Enables partial withdrawals by destroying individual stakes.
-/// - **Extension sandboxing**: Witness-gated access ensures extensions operate
-///   in isolation without reading or interfering with each other's state.
+/// - **Authorities as credentials**: Permanent badges proving the stake completed
+///   specific interactions. Non-removable by design — a credential cannot be revoked
+///   by the holder (e.g., you cannot un-burn tokens). Consumers like reward pools
+///   can gate access based on these badges.
+/// - **Extensions as capabilities**: Stateful attachments representing active
+///   relationships (e.g., reward pool registration). Witness-gated for writes,
+///   but removable by the stake owner for cleanup.
 /// - **Owned object model**: No capability required; object ownership provides
 ///   authorization. Wrap in a shared object with caps if shared access is needed.
 module stake::stake;
@@ -38,7 +44,8 @@ use sui::vec_set::{Self, VecSet};
 /// to enable functionality like reward distribution or governance.
 public struct Stake<phantom Share> has key, store {
     id: UID,
-    /// Stores witness types for integrations that require authorization.
+    /// Permanent badges proving the stake completed specific interactions.
+    /// Added by witness-gated modules, non-removable by the stake owner.
     authorities: VecSet<TypeName>,
     /// Tracks attached extension types for enumeration and destroy-time validation.
     extensions: VecSet<TypeName>,
