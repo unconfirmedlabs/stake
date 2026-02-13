@@ -152,6 +152,33 @@ let coin = coin::from_balance(balance, ctx);
 | `extensions<Share>(stake)` | Get set of attached extension types |
 | `has_extension<S, E>(stake)` | Check if extension type is attached |
 
+## Extension Architecture
+
+Stake uses **isolated Bag storage** rather than exposing raw `&mut UID` to extensions. This is a deliberate choice driven by Stake's role as a generic primitive.
+
+### Why Isolated Storage
+
+Stake is designed to be a building block that any third-party module can extend. The stake owner doesn't control which extensions exist in the ecosystem or how they interact. If extensions received `&mut UID`, a registered extension could read, modify, or remove dynamic fields belonging to other extensions on the same stake — since dynamic field keys like `ExtensionKey<phantom E>` are constructible by any module that knows the type parameter.
+
+Isolated Bag storage makes cross-extension interference structurally impossible. Each extension gets its own `Bag`, and only the module that defines the witness type can access it. This is analogous to Rust's ownership model: rather than handing out `&mut self` to every plugin, each plugin gets `&mut its_own_field`.
+
+### Why Cooperative Removal
+
+Extensions control their own data lifecycle through the Bag. The stake owner can remove an extension only when its storage is empty — the extension module decides when cleanup happens. This prevents two failure modes:
+
+- **Orphaned state**: The owner force-removes an extension that has active registrations (e.g., staked in a reward pool), leaving dangling references.
+- **Hostage-taking**: An extension refuses to release a stake, permanently locking the user's funds.
+
+The result is a clean separation — the extension controls its data, the owner controls their stake, and neither party can force the other into an inconsistent state.
+
+### Comparison with Other Models
+
+| Model | UID Access | Isolation | Best For |
+|-------|-----------|-----------|----------|
+| **Stake (Bag)** | None — extensions get `&mut Bag` | Structural | Generic primitives with untrusted extensions |
+| **MusicOS (raw UID)** | `&mut UID` via witness + registration | By convention | Permissionless protocols needing full Sui primitive access |
+| **Sona Player (registry)** | `&mut UID` via witness + Settings | By convention | Managed systems with centralized extension control |
+
 ## Type Parameters
 
 - `Share`: The fungible token type being staked
